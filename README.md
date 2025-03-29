@@ -17,3 +17,5 @@ $ west init -m https://github.com/jevinskie/stm32f1-usb-gofast stm32f1-usb-gofas
 $ west update
 $ # TODO: cmake + ninja build
 ```
+
+[West Manifests](https://docs.zephyrproject.org/latest/develop/west/manifest.html)
