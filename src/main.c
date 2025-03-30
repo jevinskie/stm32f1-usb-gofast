@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(main);
 
 /* 1000 msec = 1 sec */
 #define SLEEP_TIME_MS 1000
@@ -17,6 +20,8 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 int main(void) {
     int ret;
     bool led_state = true;
+
+    LOG_INF("entered main.");
 
     if (!gpio_is_ready_dt(&led)) {
         return 0;
