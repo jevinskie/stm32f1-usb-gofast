@@ -1,1 +1,13 @@
+config GOFK_BULK_EP_MP
+	int
+	depends on USB_DEVICE_STACK
+	default 512 if USB_DC_HAS_HS_SUPPORT
+	default 64
+	help
+	  gofk bulk endpoint size
+
+module = GOFK
+module-str = gofk
+source "subsys/logging/Kconfig.template.log_config"
+
 source "Kconfig.zephyr"
