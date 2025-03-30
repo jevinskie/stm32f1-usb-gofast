@@ -32,6 +32,8 @@ int main(void) {
         return 0;
     }
 
+    printk("printk float: %f\n", 1.2 + ret);
+
     while (1) {
         ret = gpio_pin_toggle_dt(&led);
         if (ret < 0) {
