@@ -1,171 +1,261 @@
 
-#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(sfunc, LOG_LEVEL_INF);
+
+#include <zephyr/drivers/usb/udc.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/usb/usb_ch9.h>
-#include <zephyr/usb/usb_device.h>
+#include <zephyr/usb/usbd.h>
 
-LOG_MODULE_REGISTER(usb);
+/*
+ * This file implements a simple USB function that echoes received data back to
+ * the host using bulk endpoints.
+ */
 
-enum usb_req_type {
-    GET_SPI_MAGIC  = 0x60,
-    SET_SPI_CONFIG = 0x61,
-    GET_SPI_CONFIG = 0x62,
-};
+NET_BUF_POOL_FIXED_DEFINE(sfunc_pool, 1, 0, sizeof(struct udc_buf_info), NULL);
 
-#define LOOPBACK_OUT_EP_ADDR 0x01
-#define LOOPBACK_IN_EP_ADDR  0x81
+UDC_STATIC_BUF_DEFINE(sfunc_buf, 512);
 
-#define LOOPBACK_OUT_EP_IDX  0
-#define LOOPBACK_IN_EP_IDX   1
-
-static uint8_t copi_buf_raw[1024];
-static uint8_t cipo_buf_raw[sizeof(copi_buf_raw)];
-
-/* usb.rst config structure start */
-struct usb_loopback_config {
+struct sfunc_desc {
     struct usb_if_descriptor if0;
     struct usb_ep_descriptor if0_out_ep;
     struct usb_ep_descriptor if0_in_ep;
-} __packed;
-
-USBD_CLASS_DESCR_DEFINE(primary, 0)
-struct usb_loopback_config loopback_cfg = {
-    /* Interface descriptor 0 */
-    .if0 =
-        {
-            .bLength            = sizeof(struct usb_if_descriptor),
-            .bDescriptorType    = USB_DESC_INTERFACE,
-            .bInterfaceNumber   = 0,
-            .bAlternateSetting  = 0,
-            .bNumEndpoints      = 2,
-            .bInterfaceClass    = USB_BCC_VENDOR,
-            .bInterfaceSubClass = 0,
-            .bInterfaceProtocol = 0,
-            .iInterface         = 0,
-        },
-
-    /* Data Endpoint OUT */
-    .if0_out_ep =
-        {
-            .bLength          = sizeof(struct usb_ep_descriptor),
-            .bDescriptorType  = USB_DESC_ENDPOINT,
-            .bEndpointAddress = LOOPBACK_OUT_EP_ADDR,
-            .bmAttributes     = USB_EP_TYPE_BULK,
-            .wMaxPacketSize   = sys_cpu_to_le16(64),
-            .bInterval        = 0x00,
-        },
-
-    /* Data Endpoint IN */
-    .if0_in_ep =
-        {
-            .bLength          = sizeof(struct usb_ep_descriptor),
-            .bDescriptorType  = USB_DESC_ENDPOINT,
-            .bEndpointAddress = LOOPBACK_IN_EP_ADDR,
-            .bmAttributes     = USB_EP_TYPE_BULK,
-            .wMaxPacketSize   = sys_cpu_to_le16(64),
-            .bInterval        = 0x00,
-        },
+    struct usb_ep_descriptor if0_hs_out_ep;
+    struct usb_ep_descriptor if0_hs_in_ep;
+    struct usb_desc_header nil_desc;
 };
-/* usb.rst config structure end */
 
-static void loopback_out_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status) {
-    uint32_t sz;
-    usb_read(ep, NULL, 0, &sz);
-    LOG_DBG("ep 0x%x, bytes to read %d", ep, sz);
+#define SAMPLE_FUNCTION_ENABLED 0
+
+struct sfunc_data {
+    struct sfunc_desc *const desc;
+    const struct usb_desc_header **const fs_desc;
+    const struct usb_desc_header **const hs_desc;
+    atomic_t state;
+};
+
+static uint8_t sfunc_get_bulk_out(struct usbd_class_data *const c_data) {
+    struct sfunc_data *data      = usbd_class_get_private(c_data);
+    struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+    struct sfunc_desc *desc      = data->desc;
+
+    if (usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
+        return desc->if0_hs_out_ep.bEndpointAddress;
+    }
+
+    return desc->if0_out_ep.bEndpointAddress;
 }
 
-static void loopback_in_cb(uint8_t ep, enum usb_dc_ep_cb_status_code ep_status) {
-    LOG_DBG("loopback_in_cb ep 0x%x status: %d", ep, ep_status);
+static uint8_t sfunc_get_bulk_in(struct usbd_class_data *const c_data) {
+    struct sfunc_data *data      = usbd_class_get_private(c_data);
+    struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+    struct sfunc_desc *desc      = data->desc;
+
+    if (usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
+        return desc->if0_hs_in_ep.bEndpointAddress;
+    }
+
+    return desc->if0_in_ep.bEndpointAddress;
 }
 
-/* usb.rst endpoint configuration start */
-static struct usb_ep_cfg_data ep_cfg[] = {
-    {
-        .ep_cb   = loopback_out_cb,
-        .ep_addr = LOOPBACK_OUT_EP_ADDR,
-    },
-    {
-        .ep_cb   = loopback_in_cb,
-        .ep_addr = LOOPBACK_IN_EP_ADDR,
-    },
-};
-/* usb.rst endpoint configuration end */
+static int sfunc_request_handler(struct usbd_class_data *c_data, struct net_buf *buf, int err) {
+    struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+    struct sfunc_data *data      = usbd_class_get_private(c_data);
+    struct udc_buf_info *bi      = NULL;
 
-static void loopback_status_cb(struct usb_cfg_data *cfg, enum usb_dc_status_code status,
-                               const uint8_t *param) {
-    ARG_UNUSED(cfg);
+    bi = (struct udc_buf_info *)net_buf_user_data(buf);
+    LOG_INF("Transfer finished %p -> ep 0x%02x, len %u, err %d", (void *)c_data, bi->ep, buf->len,
+            err);
 
-    switch (status) {
-    case USB_DC_INTERFACE:
-        loopback_in_cb(ep_cfg[LOOPBACK_IN_EP_IDX].ep_addr, 0);
-        LOG_DBG("USB interface configured");
-        break;
-    case USB_DC_SET_HALT:
-        LOG_DBG("Set Feature ENDPOINT_HALT");
-        break;
-    case USB_DC_CLEAR_HALT:
-        LOG_DBG("Clear Feature ENDPOINT_HALT");
-        if (*param == ep_cfg[LOOPBACK_IN_EP_IDX].ep_addr) {
-            loopback_in_cb(ep_cfg[LOOPBACK_IN_EP_IDX].ep_addr, 0);
+    if (atomic_test_bit(&data->state, SAMPLE_FUNCTION_ENABLED) && err == 0) {
+        uint8_t ep = bi->ep;
+
+        memset(bi, 0, sizeof(struct udc_buf_info));
+
+        if (ep == sfunc_get_bulk_in(c_data)) {
+            bi->ep = sfunc_get_bulk_out(c_data);
+            net_buf_reset(buf);
+        } else {
+            bi->ep = sfunc_get_bulk_in(c_data);
         }
-        break;
-    default:
-        break;
-    }
-}
 
-/* usb.rst vendor handler start */
-static int loopback_vendor_handler(struct usb_setup_packet *setup, int32_t *len, uint8_t **data) {
-    LOG_DBG("Class request: bRequest 0x%x bmRequestType 0x%x len %d", setup->bRequest,
-            setup->bmRequestType, *len);
-
-    if (USB_REQTYPE_GET_RECIPIENT(setup->bmRequestType) != USB_REQTYPE_RECIPIENT_INTERFACE) {
-        return -ENOTSUP;
-    }
-
-    if (USB_REQTYPE_GET_DIR(setup->bmRequestType) == USB_REQTYPE_DIR_TO_HOST &&
-        setup->bRequest == GET_SPI_MAGIC) {
-        LOG_DBG("Device-to-Host, GET_SPI_CONFIG returning deadbeef");
-        uint32_t db = 0xdeadbeefU;
-        memcpy(*data, &db, MIN(sizeof(db), setup->wLength));
-        return 0;
-    } else if (USB_REQTYPE_GET_DIR(setup->bmRequestType) == USB_REQTYPE_DIR_TO_DEVICE &&
-               setup->bRequest == SET_SPI_CONFIG) {
-        LOG_DBG("Host-to-Device, SET_SPI_CONFIG len: %d", *len);
-        return 0;
-    } else if ((USB_REQTYPE_GET_DIR(setup->bmRequestType) == USB_REQTYPE_DIR_TO_HOST) &&
-               (setup->bRequest == GET_SPI_CONFIG)) {
-        for (uint32_t i = 0; i < setup->wLength; ++i) {
-            (*data)[i] = i + 0x80;
+        if (usbd_ep_enqueue(c_data, buf)) {
+            LOG_ERR("Failed to enqueue buffer");
+            usbd_ep_buf_free(uds_ctx, buf);
         }
-        LOG_DBG("Device-to-Host, GET_SPI_CONFIG len: %d", *len);
-        return 0;
+    } else {
+        LOG_ERR("Function is disabled or transfer failed");
+        usbd_ep_buf_free(uds_ctx, buf);
     }
 
-    return -ENOTSUP;
-}
-/* usb.rst vendor handler end */
-
-static void loopback_interface_config(struct usb_desc_header *head, uint8_t bInterfaceNumber) {
-    ARG_UNUSED(head);
-
-    loopback_cfg.if0.bInterfaceNumber = bInterfaceNumber;
+    return 0;
 }
 
-/* usb.rst device config data start */
-USBD_DEFINE_CFG_DATA(loopback) = {
-    .usb_device_description = NULL,
-    .interface_config       = loopback_interface_config,
-    .interface_descriptor   = &loopback_cfg.if0,
-    .cb_usb_status          = loopback_status_cb,
-    .interface =
-        {
-            .class_handler  = NULL,
-            .custom_handler = NULL,
-            .vendor_handler = loopback_vendor_handler,
-        },
-    .num_endpoints = ARRAY_SIZE(ep_cfg),
-    .endpoint      = ep_cfg,
+static void *sfunc_get_desc(struct usbd_class_data *const c_data, const enum usbd_speed speed) {
+    struct sfunc_data *data = usbd_class_get_private(c_data);
+
+    if (speed == USBD_SPEED_HS) {
+        return data->hs_desc;
+    }
+
+    return data->fs_desc;
+}
+
+struct net_buf *sfunc_buf_alloc(struct usbd_class_data *const c_data, const uint8_t ep) {
+    struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+    struct net_buf *buf          = NULL;
+    struct udc_buf_info *bi;
+    size_t size;
+
+    if (usbd_bus_speed(uds_ctx) == USBD_SPEED_HS) {
+        size = 512U;
+    } else {
+        size = 64U;
+    }
+
+    buf = net_buf_alloc_with_data(&sfunc_pool, sfunc_buf, size, K_NO_WAIT);
+    net_buf_reset(buf);
+    if (!buf) {
+        return NULL;
+    }
+
+    bi     = udc_get_buf_info(buf);
+    bi->ep = ep;
+
+    return buf;
+}
+
+static void sfunc_enable(struct usbd_class_data *const c_data) {
+    struct sfunc_data *data      = usbd_class_get_private(c_data);
+    struct usbd_context *uds_ctx = usbd_class_get_ctx(c_data);
+    struct net_buf *buf;
+
+    LOG_INF("Configuration enabled");
+
+    if (!atomic_test_and_set_bit(&data->state, SAMPLE_FUNCTION_ENABLED)) {
+        buf = sfunc_buf_alloc(c_data, sfunc_get_bulk_out(c_data));
+        if (buf == NULL) {
+            LOG_ERR("Failed to allocate buffer");
+            return;
+        }
+
+        if (usbd_ep_enqueue(c_data, buf)) {
+            LOG_ERR("Failed to enqueue buffer");
+            usbd_ep_buf_free(uds_ctx, buf);
+        }
+    }
+}
+
+static void sfunc_disable(struct usbd_class_data *const c_data) {
+    struct sfunc_data *data = usbd_class_get_private(c_data);
+
+    atomic_clear_bit(&data->state, SAMPLE_FUNCTION_ENABLED);
+    LOG_INF("Configuration disabled");
+}
+
+static int sfunc_init(struct usbd_class_data *c_data) {
+    LOG_DBG("Init class instance %p", (void *)c_data);
+
+    return 0;
+}
+
+struct usbd_class_api sfunc_api = {
+    .request  = sfunc_request_handler,
+    .get_desc = sfunc_get_desc,
+    .enable   = sfunc_enable,
+    .disable  = sfunc_disable,
+    .init     = sfunc_init,
 };
-/* usb.rst device config data end */
+
+#define SFUNC_DESCRIPTOR_DEFINE(n, _)                                   \
+    static struct sfunc_desc sfunc_desc_##n = {                         \
+        /* Interface descriptor 0 */                                    \
+        .if0 =                                                          \
+            {                                                           \
+                .bLength            = sizeof(struct usb_if_descriptor), \
+                .bDescriptorType    = USB_DESC_INTERFACE,               \
+                .bInterfaceNumber   = 0,                                \
+                .bAlternateSetting  = 0,                                \
+                .bNumEndpoints      = 2,                                \
+                .bInterfaceClass    = USB_BCC_VENDOR,                   \
+                .bInterfaceSubClass = 0,                                \
+                .bInterfaceProtocol = 0,                                \
+                .iInterface         = 0,                                \
+            },                                                          \
+                                                                        \
+        /* Endpoint OUT */                                              \
+        .if0_out_ep =                                                   \
+            {                                                           \
+                .bLength          = sizeof(struct usb_ep_descriptor),   \
+                .bDescriptorType  = USB_DESC_ENDPOINT,                  \
+                .bEndpointAddress = 0x01,                               \
+                .bmAttributes     = USB_EP_TYPE_BULK,                   \
+                .wMaxPacketSize   = sys_cpu_to_le16(64U),               \
+                .bInterval        = 0x00,                               \
+            },                                                          \
+                                                                        \
+        /* Endpoint IN */                                               \
+        .if0_in_ep =                                                    \
+            {                                                           \
+                .bLength          = sizeof(struct usb_ep_descriptor),   \
+                .bDescriptorType  = USB_DESC_ENDPOINT,                  \
+                .bEndpointAddress = 0x81,                               \
+                .bmAttributes     = USB_EP_TYPE_BULK,                   \
+                .wMaxPacketSize   = sys_cpu_to_le16(64U),               \
+                .bInterval        = 0x00,                               \
+            },                                                          \
+                                                                        \
+        /* High-speed Endpoint OUT */                                   \
+        .if0_hs_out_ep =                                                \
+            {                                                           \
+                .bLength          = sizeof(struct usb_ep_descriptor),   \
+                .bDescriptorType  = USB_DESC_ENDPOINT,                  \
+                .bEndpointAddress = 0x01,                               \
+                .bmAttributes     = USB_EP_TYPE_BULK,                   \
+                .wMaxPacketSize   = sys_cpu_to_le16(512),               \
+                .bInterval        = 0x00,                               \
+            },                                                          \
+                                                                        \
+        /* High-speed Endpoint IN */                                    \
+        .if0_hs_in_ep =                                                 \
+            {                                                           \
+                .bLength          = sizeof(struct usb_ep_descriptor),   \
+                .bDescriptorType  = USB_DESC_ENDPOINT,                  \
+                .bEndpointAddress = 0x81,                               \
+                .bmAttributes     = USB_EP_TYPE_BULK,                   \
+                .wMaxPacketSize   = sys_cpu_to_le16(512),               \
+                .bInterval        = 0x00,                               \
+            },                                                          \
+                                                                        \
+        /* Termination descriptor */                                    \
+        .nil_desc =                                                     \
+            {                                                           \
+                .bLength         = 0,                                   \
+                .bDescriptorType = 0,                                   \
+            },                                                          \
+    };                                                                  \
+                                                                        \
+    const static struct usb_desc_header *sfunc_fs_desc_##n[] = {        \
+        (struct usb_desc_header *)&sfunc_desc_##n.if0,                  \
+        (struct usb_desc_header *)&sfunc_desc_##n.if0_in_ep,            \
+        (struct usb_desc_header *)&sfunc_desc_##n.if0_out_ep,           \
+        (struct usb_desc_header *)&sfunc_desc_##n.nil_desc,             \
+    };                                                                  \
+                                                                        \
+    const static struct usb_desc_header *sfunc_hs_desc_##n[] = {        \
+        (struct usb_desc_header *)&sfunc_desc_##n.if0,                  \
+        (struct usb_desc_header *)&sfunc_desc_##n.if0_hs_in_ep,         \
+        (struct usb_desc_header *)&sfunc_desc_##n.if0_hs_out_ep,        \
+        (struct usb_desc_header *)&sfunc_desc_##n.nil_desc,             \
+    };
+
+#define SFUNC_FUNCTION_DATA_DEFINE(n, _)                             \
+    static struct sfunc_data sfunc_data_##n = {                      \
+        .desc    = &sfunc_desc_##n,                                  \
+        .fs_desc = sfunc_fs_desc_##n,                                \
+        .hs_desc = sfunc_hs_desc_##n,                                \
+    };                                                               \
+                                                                     \
+    USBD_DEFINE_CLASS(sfunc_##n, &sfunc_api, &sfunc_data_##n, NULL);
+
+LISTIFY(1, SFUNC_DESCRIPTOR_DEFINE, ())
+LISTIFY(1, SFUNC_FUNCTION_DATA_DEFINE, ())

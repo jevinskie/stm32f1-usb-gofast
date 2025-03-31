@@ -3,6 +3,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/usb/usb_device.h>
 
 LOG_MODULE_REGISTER(main);
 
@@ -23,6 +24,13 @@ int main(void) {
     bool led_state = true;
 
     LOG_INF("entered main.");
+
+    ret = usb_enable(NULL);
+    if (ret != 0) {
+        LOG_ERR("Failed to enable USB");
+        return 0;
+    }
+    LOG_INF("Enabled USB");
 
     if (!gpio_is_ready_dt(&led)) {
         return 0;
